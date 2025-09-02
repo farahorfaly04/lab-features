@@ -1,0 +1,54 @@
+# NDI Plugin Manifest
+name: "ndi"
+version: "0.1.0"
+description: "NDI plugin for orchestrator with web UI and API"
+plugin_class: "ndi_plugin.NDIPlugin"
+
+# Plugin settings
+settings:
+  discovery_timeout: 3.0
+  sources: []  # Will be populated dynamically
+
+# API endpoints provided
+api_endpoints:
+  - path: "/status"
+    method: "GET"
+    description: "Get NDI plugin status"
+  - path: "/sources"
+    method: "GET"
+    description: "List available NDI sources"
+  - path: "/devices"
+    method: "GET"
+    description: "List devices with NDI capability"
+  - path: "/send"
+    method: "POST"
+    description: "Send NDI command to device"
+
+# UI configuration
+ui:
+  path: "/ui/ndi"
+  template: "ndi.html"
+  title: "NDI"
+
+# MQTT topics handled
+mqtt_topics:
+  - "/lab/orchestrator/ndi/cmd"
+
+# Supported orchestrator actions
+actions:
+  - name: "start"
+    description: "Start NDI viewer on device"
+  - name: "stop"
+    description: "Stop NDI viewer on device"
+  - name: "set_input"
+    description: "Change NDI input source on device"
+  - name: "record_start"
+    description: "Start recording on device"
+  - name: "record_stop"
+    description: "Stop recording on device"
+  - name: "reserve"
+    description: "Reserve device for exclusive use"
+  - name: "release"
+    description: "Release device reservation"
+  - name: "schedule"
+    description: "Schedule commands for later execution"

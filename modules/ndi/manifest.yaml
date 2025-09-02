@@ -1,0 +1,65 @@
+# NDI Module Manifest
+name: "ndi"
+version: "0.1.0"
+description: "NDI (Network Device Interface) module for video streaming"
+module_file: "ndi_module.py"
+class_name: "NDIModule"
+
+# Module configuration schema
+config_schema:
+  ndi_path:
+    type: "string"
+    description: "Path to NDI runtime libraries"
+    required: false
+  ndi_env:
+    type: "object"
+    description: "Additional environment variables for NDI"
+    required: false
+  start_cmd_template:
+    type: "string"
+    description: "Command template to start NDI viewer"
+    required: true
+  record_start_cmd_template:
+    type: "string"
+    description: "Command template to start NDI recording"
+    required: false
+  log_file:
+    type: "string"
+    description: "Path to log file"
+    required: false
+  set_input_restart:
+    type: "boolean"
+    description: "Whether to restart viewer when changing input"
+    default: true
+
+# Default configuration
+default_config:
+  ndi_path: "/usr/local/lib/ndi"
+  start_cmd_template: "ndi-viewer {source}"
+  record_start_cmd_template: "ndi-recorder -i {source} -o /tmp/recording_{device_id}.mp4"
+  set_input_restart: true
+
+# Supported actions
+actions:
+  - name: "start"
+    description: "Start NDI viewer with specified source"
+    params:
+      source:
+        type: "string"
+        required: true
+  - name: "stop"
+    description: "Stop NDI viewer"
+  - name: "set_input"
+    description: "Change NDI input source"
+    params:
+      source:
+        type: "string"
+        required: true
+  - name: "record_start"
+    description: "Start recording NDI stream"
+    params:
+      source:
+        type: "string"
+        required: false
+  - name: "record_stop"
+    description: "Stop recording NDI stream"
