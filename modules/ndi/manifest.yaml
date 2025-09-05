@@ -49,6 +49,14 @@ actions:
         required: true
   - name: "stop"
     description: "Stop NDI viewer"
+  - name: "restart"
+    description: "Restart NDI viewer with current or specified source"
+    params:
+      source:
+        type: "string"
+        required: false
+  - name: "status"
+    description: "Get detailed module status"
   - name: "set_input"
     description: "Change NDI input source"
     params:
@@ -61,5 +69,11 @@ actions:
       source:
         type: "string"
         required: false
+      output_path:
+        type: "string"
+        required: false
+        description: "Custom output file path"
   - name: "record_stop"
     description: "Stop recording NDI stream"
+  - name: "list_processes"
+    description: "List running NDI processes and their status"

@@ -1,21 +1,20 @@
-"""NDI Plugin for Lab Platform orchestrator."""
+"""Projector Plugin for Lab Platform orchestrator."""
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Dict, Any, List
-import time
 import sys
 from pathlib import Path
-from cyndilib.finder import Finder 
+
 # Import orchestrator plugin API
 from lab_orchestrator.plugin_api import OrchestratorPlugin
 from lab_orchestrator.services.events import ack
 
 
-class NDIPlugin(OrchestratorPlugin):
-    """NDI plugin for the Lab Platform orchestrator."""
+class ProjectorPlugin(OrchestratorPlugin):
+    """Projector plugin for the Lab Platform orchestrator."""
     
-    module_name = "ndi"
+    module_name = "projector"
 
     def mqtt_topic_filters(self):
         """Return MQTT topics this plugin handles."""
@@ -30,7 +29,10 @@ class NDIPlugin(OrchestratorPlugin):
         actor = payload.get("actor", "app")
 
         # Passthrough actions - forward directly to device module
-        passthrough = {"start", "stop", "restart", "status", "set_input", "record_start", "record_stop", "list_processes"}
+        passthrough = {
+            "power_on", "power_off", "set_input", "set_aspect_ratio", 
+            "navigate", "adjust_image", "send_raw_command"
+        }
         if action in passthrough:
             dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
             self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
@@ -128,141 +130,66 @@ class NDIPlugin(OrchestratorPlugin):
             )
 
     def api_router(self):
-        """Create FastAPI router for NDI endpoints."""
+        """Create FastAPI router for projector endpoints."""
         r = APIRouter()
 
-        class SendBody(BaseModel):
+        class PowerBody(BaseModel):
             device_id: str
-            source: str
-            action: str | None = None  # default to "start"
+            power: str  # "on" or "off"
 
-        class StartBody(BaseModel):
+        class InputBody(BaseModel):
             device_id: str
-            source: str
+            input: str  # "HDMI1" or "HDMI2"
 
-        class StopBody(BaseModel):
+        class AspectBody(BaseModel):
             device_id: str
+            ratio: str  # "4:3" or "16:9"
 
-        class RestartBody(BaseModel):
+        class NavigateBody(BaseModel):
             device_id: str
-            source: str | None = None
+            direction: str  # "UP", "DOWN", "LEFT", "RIGHT", "ENTER", "MENU", "BACK"
 
-        class RecordStartBody(BaseModel):
+        class AdjustBody(BaseModel):
             device_id: str
-            source: str | None = None
-            output_path: str | None = None
+            adjustment: str  # "H-IMAGE-SHIFT", "V-IMAGE-SHIFT", "H-KEYSTONE", "V-KEYSTONE"
+            value: int
 
-        class RecordStopBody(BaseModel):
+        class RawCommandBody(BaseModel):
             device_id: str
-
-        class SetInputBody(BaseModel):
-            device_id: str
-            source: str
+            command: str
 
         @r.get("/status")
         def status():
-            """Get plugin status and registry snapshot."""
+            """Get plugin status."""
             reg = self.ctx.registry.snapshot()
-            return {
-                "plugin": "ndi",
-                "version": "0.1.0",
-                "registry": reg,
-                "timestamp": time.time()
-            }
-
-        @r.get("/sources")
-        def sources() -> Dict[str, Any]:
-            """Get available NDI sources."""
-            discovered: List[str] = []
-            error = None
-            try:
-                discovered = _discover_ndi_source_names(timeout=3.0)
-            except Exception as e:
-                error = str(e)
-                discovered = []
-            
-            return {
-                "sources": discovered, 
-                "count": len(discovered),
-                "discovery_error": error,
-                "timestamp": time.time()
-            }
-
-        @r.get("/sources/refresh")
-        def refresh_sources() -> Dict[str, Any]:
-            """Force refresh NDI sources with longer timeout."""
-            discovered: List[str] = []
-            error = None
-            try:
-                discovered = _discover_ndi_source_names(timeout=10.0)  # Longer timeout for manual refresh
-            except Exception as e:
-                error = str(e)
-                discovered = []
-            
-            return {
-                "sources": discovered, 
-                "count": len(discovered),
-                "discovery_error": error,
-                "timestamp": time.time(),
-                "refreshed": True
-            }
+            return reg
 
         @r.get("/devices")
         def devices() -> Dict[str, Any]:
-            """Get devices with NDI capability."""
+            """Get devices with projector capability."""
             reg = self.ctx.registry.snapshot()
-            ndi_devices = {}
+            projector_devices = {}
             
             for did, meta in reg.get("devices", {}).items():
                 modules = meta.get("modules", [])
-                if "ndi" in modules:
-                    device_state = meta.get("state", {}).get("ndi", {})
-                    ndi_devices[did] = {
+                if "projector" in modules:
+                    projector_devices[did] = {
                         "device_id": did,
                         "online": meta.get("online", True),
-                        "capabilities": meta.get("capabilities", {}).get("ndi", {}),
-                        "state": device_state,
-                        "current_input": device_state.get("input"),
-                        "viewer_running": device_state.get("pid") is not None,
-                        "recording": device_state.get("recording", False),
-                        "last_seen": meta.get("last_seen"),
+                        "capabilities": meta.get("capabilities", {}).get("projector", {}),
+                        "current_state": meta.get("state", {}),
                     }
             
-            return {"devices": ndi_devices, "count": len(ndi_devices)}
+            return {"devices": projector_devices}
 
-        @r.get("/devices/{device_id}")
-        def device_detail(device_id: str) -> Dict[str, Any]:
-            """Get detailed information about a specific NDI device."""
-            reg = self.ctx.registry.snapshot()
-            device_meta = reg.get("devices", {}).get(device_id)
-            
-            if not device_meta:
-                raise HTTPException(status_code=404, detail="Device not found")
-            
-            if "ndi" not in device_meta.get("modules", []):
-                raise HTTPException(status_code=400, detail="Device does not support NDI")
-            
-            device_state = device_meta.get("state", {}).get("ndi", {})
-            
-            return {
-                "device_id": device_id,
-                "online": device_meta.get("online", True),
-                "capabilities": device_meta.get("capabilities", {}).get("ndi", {}),
-                "state": device_state,
-                "current_input": device_state.get("input"),
-                "viewer_running": device_state.get("pid") is not None,
-                "viewer_pid": device_state.get("pid"),
-                "recording": device_state.get("recording", False),
-                "record_pid": device_state.get("record_pid"),
-                "last_seen": device_meta.get("last_seen"),
-                "uptime": device_meta.get("uptime"),
-            }
-
-        @r.post("/start")
-        def start_viewer(body: StartBody):
-            """Start NDI viewer on device."""
+        @r.post("/power")
+        def power(body: PowerBody):
+            """Control projector power."""
             device_id = body.device_id
-            source = body.source
+            power_state = body.power.lower()
+            
+            if power_state not in ["on", "off"]:
+                raise HTTPException(status_code=400, detail="Power must be 'on' or 'off'")
             
             # Validate device exists
             reg = self.ctx.registry.snapshot()
@@ -272,43 +199,12 @@ class NDIPlugin(OrchestratorPlugin):
             import uuid
             from lab_orchestrator.services.events import now_iso
             
+            action = "power_on" if power_state == "on" else "power_off"
             payload = {
                 "req_id": str(uuid.uuid4()),
                 "actor": "api",
                 "ts": now_iso(),
-                "action": "start",
-                "params": {"device_id": device_id, "source": source},
-            }
-            
-            dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
-            self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
-            
-            return {
-                "ok": True, 
-                "dispatched": True, 
-                "device_id": device_id, 
-                "source": source, 
-                "action": "start"
-            }
-
-        @r.post("/stop")
-        def stop_viewer(body: StopBody):
-            """Stop NDI viewer on device."""
-            device_id = body.device_id
-            
-            # Validate device exists
-            reg = self.ctx.registry.snapshot()
-            if device_id not in reg.get("devices", {}):
-                raise HTTPException(status_code=404, detail="Unknown device")
-
-            import uuid
-            from lab_orchestrator.services.events import now_iso
-            
-            payload = {
-                "req_id": str(uuid.uuid4()),
-                "actor": "api",
-                "ts": now_iso(),
-                "action": "stop",
+                "action": action,
                 "params": {"device_id": device_id},
             }
             
@@ -319,51 +215,17 @@ class NDIPlugin(OrchestratorPlugin):
                 "ok": True, 
                 "dispatched": True, 
                 "device_id": device_id, 
-                "action": "stop"
-            }
-
-        @r.post("/restart")
-        def restart_viewer(body: RestartBody):
-            """Restart NDI viewer on device."""
-            device_id = body.device_id
-            source = body.source
-            
-            # Validate device exists
-            reg = self.ctx.registry.snapshot()
-            if device_id not in reg.get("devices", {}):
-                raise HTTPException(status_code=404, detail="Unknown device")
-
-            import uuid
-            from lab_orchestrator.services.events import now_iso
-            
-            params = {"device_id": device_id}
-            if source:
-                params["source"] = source
-                
-            payload = {
-                "req_id": str(uuid.uuid4()),
-                "actor": "api",
-                "ts": now_iso(),
-                "action": "restart",
-                "params": params,
-            }
-            
-            dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
-            self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
-            
-            return {
-                "ok": True, 
-                "dispatched": True, 
-                "device_id": device_id, 
-                "source": source,
-                "action": "restart"
+                "action": action
             }
 
         @r.post("/input")
-        def set_input(body: SetInputBody):
-            """Set NDI input source on device."""
+        def set_input(body: InputBody):
+            """Set projector input source."""
             device_id = body.device_id
-            source = body.source
+            input_source = body.input
+            
+            if input_source not in ["HDMI1", "HDMI2"]:
+                raise HTTPException(status_code=400, detail="Input must be 'HDMI1' or 'HDMI2'")
             
             # Validate device exists
             reg = self.ctx.registry.snapshot()
@@ -378,7 +240,7 @@ class NDIPlugin(OrchestratorPlugin):
                 "actor": "api",
                 "ts": now_iso(),
                 "action": "set_input",
-                "params": {"device_id": device_id, "source": source},
+                "params": {"device_id": device_id, "input": input_source},
             }
             
             dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
@@ -388,55 +250,17 @@ class NDIPlugin(OrchestratorPlugin):
                 "ok": True, 
                 "dispatched": True, 
                 "device_id": device_id, 
-                "source": source, 
-                "action": "set_input"
+                "input": input_source
             }
 
-        @r.post("/record/start")
-        def start_recording(body: RecordStartBody):
-            """Start recording NDI stream."""
+        @r.post("/aspect")
+        def set_aspect(body: AspectBody):
+            """Set projector aspect ratio."""
             device_id = body.device_id
-            source = body.source
-            output_path = body.output_path
+            ratio = body.ratio
             
-            # Validate device exists
-            reg = self.ctx.registry.snapshot()
-            if device_id not in reg.get("devices", {}):
-                raise HTTPException(status_code=404, detail="Unknown device")
-
-            import uuid
-            from lab_orchestrator.services.events import now_iso
-            
-            params = {"device_id": device_id}
-            if source:
-                params["source"] = source
-            if output_path:
-                params["output_path"] = output_path
-                
-            payload = {
-                "req_id": str(uuid.uuid4()),
-                "actor": "api",
-                "ts": now_iso(),
-                "action": "record_start",
-                "params": params,
-            }
-            
-            dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
-            self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
-            
-            return {
-                "ok": True, 
-                "dispatched": True, 
-                "device_id": device_id, 
-                "source": source,
-                "output_path": output_path,
-                "action": "record_start"
-            }
-
-        @r.post("/record/stop")
-        def stop_recording(body: RecordStopBody):
-            """Stop recording NDI stream."""
-            device_id = body.device_id
+            if ratio not in ["4:3", "16:9"]:
+                raise HTTPException(status_code=400, detail="Aspect ratio must be '4:3' or '16:9'")
             
             # Validate device exists
             reg = self.ctx.registry.snapshot()
@@ -450,8 +274,8 @@ class NDIPlugin(OrchestratorPlugin):
                 "req_id": str(uuid.uuid4()),
                 "actor": "api",
                 "ts": now_iso(),
-                "action": "record_stop",
-                "params": {"device_id": device_id},
+                "action": "set_aspect_ratio",
+                "params": {"device_id": device_id, "ratio": ratio},
             }
             
             dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
@@ -461,12 +285,19 @@ class NDIPlugin(OrchestratorPlugin):
                 "ok": True, 
                 "dispatched": True, 
                 "device_id": device_id, 
-                "action": "record_stop"
+                "aspect_ratio": ratio
             }
 
-        @r.get("/processes/{device_id}")
-        def list_processes(device_id: str):
-            """List NDI processes running on device."""
+        @r.post("/navigate")
+        def navigate(body: NavigateBody):
+            """Send navigation command to projector."""
+            device_id = body.device_id
+            direction = body.direction.upper()
+            
+            valid_directions = ["UP", "DOWN", "LEFT", "RIGHT", "ENTER", "MENU", "BACK"]
+            if direction not in valid_directions:
+                raise HTTPException(status_code=400, detail=f"Direction must be one of: {valid_directions}")
+            
             # Validate device exists
             reg = self.ctx.registry.snapshot()
             if device_id not in reg.get("devices", {}):
@@ -479,8 +310,8 @@ class NDIPlugin(OrchestratorPlugin):
                 "req_id": str(uuid.uuid4()),
                 "actor": "api",
                 "ts": now_iso(),
-                "action": "list_processes",
-                "params": {"device_id": device_id},
+                "action": "navigate",
+                "params": {"device_id": device_id, "direction": direction},
             }
             
             dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
@@ -490,21 +321,32 @@ class NDIPlugin(OrchestratorPlugin):
                 "ok": True, 
                 "dispatched": True, 
                 "device_id": device_id, 
-                "action": "list_processes"
+                "direction": direction
             }
 
-        # Legacy endpoint for backward compatibility
-        @r.post("/send")
-        def send(body: SendBody):
-            """Send command to NDI device (legacy endpoint)."""
+        @r.post("/adjust")
+        def adjust_image(body: AdjustBody):
+            """Adjust projector image settings."""
             device_id = body.device_id
-            source = body.source
-            action = body.action or "start"
+            adjustment = body.adjustment.upper()
+            value = body.value
+            
+            valid_adjustments = ["H-IMAGE-SHIFT", "V-IMAGE-SHIFT", "H-KEYSTONE", "V-KEYSTONE"]
+            if adjustment not in valid_adjustments:
+                raise HTTPException(status_code=400, detail=f"Adjustment must be one of: {valid_adjustments}")
+            
+            # Validate value ranges
+            if adjustment in ["H-IMAGE-SHIFT", "V-IMAGE-SHIFT"]:
+                if not (-100 <= value <= 100):
+                    raise HTTPException(status_code=400, detail="Image shift value must be between -100 and 100")
+            elif adjustment in ["H-KEYSTONE", "V-KEYSTONE"]:
+                if not (-40 <= value <= 40):
+                    raise HTTPException(status_code=400, detail="Keystone value must be between -40 and 40")
             
             # Validate device exists
             reg = self.ctx.registry.snapshot()
             if device_id not in reg.get("devices", {}):
-                raise HTTPException(status_code=404, detail="unknown device")
+                raise HTTPException(status_code=404, detail="Unknown device")
 
             import uuid
             from lab_orchestrator.services.events import now_iso
@@ -513,8 +355,8 @@ class NDIPlugin(OrchestratorPlugin):
                 "req_id": str(uuid.uuid4()),
                 "actor": "api",
                 "ts": now_iso(),
-                "action": action,
-                "params": {"device_id": device_id, "source": source},
+                "action": "adjust_image",
+                "params": {"device_id": device_id, "adjustment": adjustment, "value": value},
             }
             
             dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
@@ -524,40 +366,47 @@ class NDIPlugin(OrchestratorPlugin):
                 "ok": True, 
                 "dispatched": True, 
                 "device_id": device_id, 
-                "source": source, 
-                "action": action
+                "adjustment": adjustment,
+                "value": value
+            }
+
+        @r.post("/raw")
+        def raw_command(body: RawCommandBody):
+            """Send raw command to projector."""
+            device_id = body.device_id
+            command = body.command
+            
+            if not command.strip():
+                raise HTTPException(status_code=400, detail="Command cannot be empty")
+            
+            # Validate device exists
+            reg = self.ctx.registry.snapshot()
+            if device_id not in reg.get("devices", {}):
+                raise HTTPException(status_code=404, detail="Unknown device")
+
+            import uuid
+            from lab_orchestrator.services.events import now_iso
+            
+            payload = {
+                "req_id": str(uuid.uuid4()),
+                "actor": "api",
+                "ts": now_iso(),
+                "action": "send_raw_command",
+                "params": {"device_id": device_id, "command": command},
+            }
+            
+            dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
+            self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
+            
+            return {
+                "ok": True, 
+                "dispatched": True, 
+                "device_id": device_id, 
+                "command": command
             }
 
         return r
 
     def ui_mount(self):
         """Return UI mount configuration."""
-        return {"path": f"/ui/{self.module_name}", "template": "ndi.html", "title": "NDI"}
-
-
-def _discover_ndi_source_names(timeout: float = 3.0) -> List[str]:
-    """Discover NDI sources and return a list of human-readable names.
-
-    This function attempts to use NDI discovery to find available sources.
-    Falls back to an empty list if discovery fails.
-    """
-
-    # Try to use cyndilib for NDI discovery        
-    finder = Finder()
-    finder.open()
-    
-    try:
-        end_time = time.time() + timeout
-        while time.time() < end_time:
-            changed = finder.wait_for_sources(timeout=end_time - time.time())
-            if changed:
-                finder.update_sources()
-            time.sleep(0.1)
-
-        names: List[str] = []
-        for src in finder.iter_sources():
-            names.append(src.name)
-        return names
-    finally:
-        finder.close()
-
+        return {"path": f"/ui/{self.module_name}", "template": "projector.html", "title": "Projector Control"}

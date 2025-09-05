@@ -1,0 +1,81 @@
+# Projector Module Manifest
+name: "projector"
+version: "0.1.0"
+description: "Projector control module for RS232/USB serial communication"
+module_file: "projector_module.py"
+class_name: "ProjectorModule"
+
+# Module configuration schema
+config_schema:
+  serial_port:
+    type: "string"
+    description: "Serial port path (e.g., /dev/ttyUSB0)"
+    required: false
+  baudrate:
+    type: "integer"
+    description: "Serial communication baud rate"
+    default: 9600
+  timeout:
+    type: "number"
+    description: "Serial timeout in seconds"
+    default: 1.0
+  log_file:
+    type: "string"
+    description: "Path to log file"
+    required: false
+  auto_discover_port:
+    type: "boolean"
+    description: "Automatically discover USB serial port"
+    default: true
+
+# Default configuration
+default_config:
+  baudrate: 9600
+  timeout: 1.0
+  auto_discover_port: true
+
+# Supported actions
+actions:
+  - name: "power_on"
+    description: "Turn projector on"
+  - name: "power_off"
+    description: "Turn projector off"
+  - name: "set_input"
+    description: "Set input source"
+    params:
+      input:
+        type: "string"
+        required: true
+        enum: ["HDMI1", "HDMI2"]
+  - name: "set_aspect_ratio"
+    description: "Set aspect ratio"
+    params:
+      ratio:
+        type: "string"
+        required: true
+        enum: ["4:3", "16:9"]
+  - name: "navigate"
+    description: "Send navigation command"
+    params:
+      direction:
+        type: "string"
+        required: true
+        enum: ["UP", "DOWN", "LEFT", "RIGHT", "ENTER", "MENU", "BACK"]
+  - name: "adjust_image"
+    description: "Adjust image position or keystone"
+    params:
+      adjustment:
+        type: "string"
+        required: true
+        enum: ["H-IMAGE-SHIFT", "V-IMAGE-SHIFT", "H-KEYSTONE", "V-KEYSTONE"]
+      value:
+        type: "integer"
+        required: true
+        description: "Adjustment value (range depends on adjustment type)"
+  - name: "send_raw_command"
+    description: "Send raw ASCII command to projector"
+    params:
+      command:
+        type: "string"
+        required: true
+        description: "Raw ASCII command string"

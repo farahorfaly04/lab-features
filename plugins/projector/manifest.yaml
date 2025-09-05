@@ -1,0 +1,72 @@
+# Projector Plugin Manifest
+name: "projector"
+version: "0.1.0"
+description: "Projector plugin for orchestrator with web UI and API"
+plugin_class: "projector_plugin:ProjectorPlugin"
+
+# Plugin settings
+settings:
+  default_timeout: 5.0
+  supported_inputs: ["HDMI1", "HDMI2"]
+  supported_ratios: ["4:3", "16:9"]
+  navigation_commands: ["UP", "DOWN", "LEFT", "RIGHT", "ENTER", "MENU", "BACK"]
+
+# API endpoints provided
+api_endpoints:
+  - path: "/status"
+    method: "GET"
+    description: "Get projector plugin status"
+  - path: "/devices"
+    method: "GET"
+    description: "List devices with projector capability"
+  - path: "/power"
+    method: "POST"
+    description: "Control projector power (on/off)"
+  - path: "/input"
+    method: "POST"
+    description: "Set projector input source"
+  - path: "/aspect"
+    method: "POST"
+    description: "Set projector aspect ratio"
+  - path: "/navigate"
+    method: "POST"
+    description: "Send navigation commands"
+  - path: "/adjust"
+    method: "POST"
+    description: "Adjust image settings"
+  - path: "/raw"
+    method: "POST"
+    description: "Send raw command to projector"
+
+# UI configuration
+ui:
+  path: "/ui/projector"
+  template: "projector.html"
+  title: "Projector Control"
+
+# MQTT topics handled
+mqtt_topics:
+  - "/lab/orchestrator/projector/cmd"
+
+# Supported orchestrator actions
+actions:
+  - name: "power_on"
+    description: "Turn projector on"
+  - name: "power_off"
+    description: "Turn projector off"
+  - name: "set_input"
+    description: "Set input source on projector"
+  - name: "set_aspect_ratio"
+    description: "Set aspect ratio on projector"
+  - name: "navigate"
+    description: "Send navigation commands to projector"
+  - name: "adjust_image"
+    description: "Adjust image settings on projector"
+  - name: "send_raw_command"
+    description: "Send raw command to projector"
+  - name: "reserve"
+    description: "Reserve projector for exclusive use"
+  - name: "release"
+    description: "Release projector reservation"
+  - name: "schedule"
+    description: "Schedule commands for later execution"
