@@ -10,8 +10,26 @@ from pathlib import Path
 import sys
 
 # Import base module from device agent
-sys.path.append(str(Path(__file__).resolve().parents[3] / "device-agent" / "src"))
-from lab_agent.base import Module
+# Try multiple import paths for standalone operation
+try:
+    from lab_agent.base import Module
+except ImportError:
+    # Add device agent to path if not installed
+    possible_paths = [
+        Path(__file__).resolve().parents[3] / "device-agent" / "src",  # Development layout
+        Path.cwd() / "device-agent" / "src",  # Current directory
+        Path("/opt/lab-platform/device-agent/src"),  # System installation
+    ]
+    
+    for path in possible_paths:
+        if path.exists():
+            sys.path.insert(0, str(path))
+            break
+    
+    try:
+        from lab_agent.base import Module
+    except ImportError:
+        raise ImportError("Could not import lab_agent.base.Module. Ensure lab-agent is installed or available in path.")
 
 
 class ProjectorModule(Module):
