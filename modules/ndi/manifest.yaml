@@ -31,6 +31,14 @@ config_schema:
     type: "boolean"
     description: "Whether to restart viewer when changing input"
     default: true
+  server_cmd_template:
+    type: "string"
+    description: "Command to start standby server (optional)"
+    required: false
+  server_port:
+    type: "integer"
+    description: "Default standby server port"
+    default: 8081
 
 # Default configuration
 default_config:
@@ -38,6 +46,7 @@ default_config:
   start_cmd_template: "ndi-viewer {source}"
   record_start_cmd_template: "ndi-recorder -i {source} -o /tmp/recording_{device_id}.mp4"
   set_input_restart: true
+  server_port: 8081
 
 # Supported actions
 actions:
@@ -46,7 +55,15 @@ actions:
     params:
       source:
         type: "string"
-        required: true
+        required: false
+      stream:
+        type: "string"
+        required: false
+        description: "NDI stream name for yuri_simple"
+      pipeline:
+        type: "string"
+        required: false
+        description: "Full command pipeline to execute (e.g., yuri_simple ...)"
   - name: "stop"
     description: "Stop NDI viewer"
   - name: "restart"
@@ -77,3 +94,14 @@ actions:
     description: "Stop recording NDI stream"
   - name: "list_processes"
     description: "List running NDI processes and their status"
+  - name: "server_start"
+    description: "Start standby server (images/videos)"
+    params:
+      cmd:
+        type: "string"
+        required: false
+      port:
+        type: "integer"
+        required: false
+  - name: "server_stop"
+    description: "Stop standby server"

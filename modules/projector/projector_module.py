@@ -1,24 +1,24 @@
-"""Projector Module for Lab Platform device agents."""
+"""Simplified Projector Module for Lab Platform device agents."""
 
-from typing import Dict, Any
-import serial
 import glob
-import time
 import logging
+import platform
+import sys
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-import sys
+from typing import Dict, Any, Optional
 
-# Import base module from device agent
-# Try multiple import paths for standalone operation
+import serial
+
 try:
     from lab_agent.base import Module
 except ImportError:
     # Add device agent to path if not installed
     possible_paths = [
-        Path(__file__).resolve().parents[3] / "device-agent" / "src",  # Development layout
-        Path.cwd() / "device-agent" / "src",  # Current directory
-        Path("/opt/lab-platform/device-agent/src"),  # System installation
+        Path(__file__).resolve().parents[3] / "device-agent" / "src",
+        Path.cwd() / "device-agent" / "src",
+        Path("/opt/lab-platform/device-agent/src"),
     ]
     
     for path in possible_paths:
@@ -26,24 +26,93 @@ except ImportError:
             sys.path.insert(0, str(path))
             break
     
-    try:
-        from lab_agent.base import Module
-    except ImportError:
-        raise ImportError("Could not import lab_agent.base.Module. Ensure lab-agent is installed or available in path.")
+    from lab_agent.base import Module
+
+
+class SerialManager:
+    """Manages serial connection to projector."""
+    
+    def __init__(self, logger: logging.Logger, config: Dict[str, Any]):
+        self.log = logger
+        self.config = config
+        self.connection: Optional[serial.Serial] = None
+    
+    def find_device(self) -> Optional[str]:
+        """Find the first available USB serial device."""
+        system = platform.system().lower()
+        patterns = []
+        
+        if system == 'darwin':
+            patterns = ['/dev/tty.usbserial*', '/dev/tty.usbmodem*', '/dev/tty.SLAB_USBtoUART*']
+        elif system == 'linux':
+            patterns = ['/dev/ttyUSB*', '/dev/ttyACM*']
+        elif system == 'windows':
+            patterns = ['COM*']
+        
+        for pattern in patterns:
+            devices = glob.glob(pattern)
+            if devices:
+                return devices[0]
+        
+        return None
+    
+    def connect(self) -> bool:
+        """Establish serial connection."""
+        if self.connection and self.connection.is_open:
+            return True
+        
+        port = self.config.get("serial_port")
+        if not port:
+            port = self.find_device()
+            if not port:
+                self.log.error("No serial device found")
+                return False
+        
+        try:
+            self.connection = serial.Serial(
+                port=port,
+                baudrate=self.config.get("baudrate", 9600),
+                timeout=self.config.get("timeout", 1.0)
+            )
+            self.log.info(f"Connected to projector on {port}")
+            return True
+            
+        except Exception as e:
+            self.log.error(f"Failed to connect to {port}: {e}")
+            return False
+    
+    def disconnect(self) -> None:
+        """Close serial connection."""
+        if self.connection and self.connection.is_open:
+            self.connection.close()
+            self.log.info("Disconnected from projector")
+    
+    def send_command(self, command: str) -> bool:
+        """Send command to projector."""
+        if not self.connect():
+            return False
+        
+        try:
+            self.connection.write(command.encode())
+            self.log.info(f"Sent command: {command.strip()}")
+            return True
+        except Exception as e:
+            self.log.error(f"Failed to send command: {e}")
+            return False
 
 
 class ProjectorModule(Module):
-    """Projector control module for RS232/USB serial communication."""
+    """Simplified projector control module."""
     
     name = "projector"
-
-    # Commands for the projector (from original ascii.py)
+    
+    # Standard projector commands
     COMMANDS = {
-        # Power commands
+        # Power
         "ON": "~0000 1\r",
         "OFF": "~0000 0\r",
         
-        # Input selection
+        # Inputs
         "HDMI1": "~00305 1\r",
         "HDMI2": "~0012 15\r",
         
@@ -53,223 +122,175 @@ class ProjectorModule(Module):
         
         # Navigation
         "UP": "~00140 10\r",
-        "LEFT": "~00140 11\r",
-        "ENTER": "~00140 12\r",
-        "RIGHT": "~00140 13\r",
         "DOWN": "~00140 14\r",
+        "LEFT": "~00140 11\r",
+        "RIGHT": "~00140 13\r",
+        "ENTER": "~00140 12\r",
         "MENU": "~00140 20\r",
         "BACK": "~00140 74\r",
-        
-        # Dynamic commands (require parameters)
-        "H-IMAGE-SHIFT": "~0063 {value}\r",  # horizontal image shift (-100 <= value <= 100)
-        "V-IMAGE-SHIFT": "~0064 {value}\r",  # vertical image shift (-100 <= value <= 100)
-        "H-KEYSTONE": "~0065 {value}\r",     # horizontal keystone (-40 <= value <= 40)
-        "V-KEYSTONE": "~0066 {value}\r",     # vertical keystone (-40 <= value <= 40)
+    }
+    
+    # Commands that take parameters
+    PARAMETRIC_COMMANDS = {
+        "H-IMAGE-SHIFT": "~0063 {value}\r",  # -100 to 100
+        "V-IMAGE-SHIFT": "~0064 {value}\r",  # -100 to 100
+        "H-KEYSTONE": "~0065 {value}\r",     # -40 to 40
+        "V-KEYSTONE": "~0066 {value}\r",     # -40 to 40
     }
 
-    def __init__(self, device_id: str, cfg: Dict[str, Any] | None = None):
+    def __init__(self, device_id: str, cfg: Dict[str, Any] = None):
         super().__init__(device_id, cfg)
-        self.serial_connection: serial.Serial | None = None
-        self._setup_logger()
-        self._setup_serial()
+        self.log = self._setup_logger()
+        self.serial_manager = SerialManager(self.log, self.cfg)
+        self.current_state = {"power": "unknown", "input": "unknown"}
 
-    def _setup_logger(self) -> None:
+    def _setup_logger(self) -> logging.Logger:
         """Setup module-specific logging."""
-        self.log = logging.getLogger(f"projector.{self.device_id}")
-        if self.log.handlers:
-            return
+        logger = logging.getLogger(f"projector.{self.device_id}")
+        if logger.handlers:
+            return logger
         
-        self.log.setLevel(logging.INFO)
-        # Allow config override; fallback to /tmp/projector_<device>.log
-        log_path = Path(self.cfg.get("log_file") or f"/tmp/projector_{self.device_id}.log")
+        logger.setLevel(logging.INFO)
+        log_path = Path(self.cfg.get("log_file", f"/tmp/projector_{self.device_id}.log"))
         log_path.parent.mkdir(parents=True, exist_ok=True)
         
         handler = RotatingFileHandler(str(log_path), maxBytes=1_000_000, backupCount=3)
-        fmt = logging.Formatter("%(asctime)sZ %(levelname)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%S")
-        fmt.converter = time.gmtime  # UTC timestamps
-        handler.setFormatter(fmt)
-        self.log.addHandler(handler)
-        self.log.propagate = False
-
-    def _find_usb_serial_device(self) -> str:
-        """Find the first available USB serial device."""
-        usb_devices = glob.glob('/dev/ttyUSB*')
-        if not usb_devices:
-            raise RuntimeError("No USB serial device found")
-        return usb_devices[0]
-
-    def _setup_serial(self) -> None:
-        """Setup serial connection to projector."""
-        try:
-            # Get serial port from config or auto-discover
-            serial_port = self.cfg.get("serial_port")
-            if not serial_port and self.cfg.get("auto_discover_port", True):
-                serial_port = self._find_usb_serial_device()
-            
-            if not serial_port:
-                self.log.error("No serial port specified and auto-discovery disabled")
-                return
-            
-            baudrate = self.cfg.get("baudrate", 9600)
-            timeout = self.cfg.get("timeout", 1.0)
-            
-            self.serial_connection = serial.Serial(
-                port=serial_port,
-                baudrate=baudrate,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=timeout
-            )
-            
-            self.log.info("Serial connection established: port=%s, baudrate=%d", serial_port, baudrate)
-            self.state = "connected"
-            self.fields.update({
-                "serial_port": serial_port,
-                "baudrate": baudrate,
-                "connected": True
-            })
-            
-        except Exception as e:
-            self.log.error("Failed to setup serial connection: %s", e)
-            self.state = "error"
-            self.fields.update({"connected": False, "error": str(e)})
-
-    def on_agent_connect(self) -> None:
-        """Called when agent connects to orchestrator."""
-        self.log.info("Agent connected, projector module ready")
-
-    def _send_command(self, command: str) -> bool:
-        """Send command to projector via serial connection."""
-        if not self.serial_connection or not self.serial_connection.is_open:
-            self.log.error("Serial connection not available")
-            return False
+        formatter = logging.Formatter("%(asctime)sZ %(levelname)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%S")
+        formatter.converter = time.gmtime
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.propagate = False
         
-        try:
-            self.serial_connection.write(command.encode('utf-8'))
-            self.log.info("Sent command: %s", command.strip())
-            return True
-        except Exception as e:
-            self.log.error("Failed to send command '%s': %s", command.strip(), e)
-            return False
-
-    def _read_response(self, timeout: float = 2.0) -> str:
-        """Read response from projector."""
-        if not self.serial_connection or not self.serial_connection.is_open:
-            return ""
-        
-        try:
-            start_time = time.time()
-            response_parts = []
-            
-            while time.time() - start_time < timeout:
-                if self.serial_connection.in_waiting > 0:
-                    data = self.serial_connection.read(self.serial_connection.in_waiting)
-                    response_parts.append(data.decode('ascii', errors='ignore'))
-                time.sleep(0.1)
-            
-            response = ''.join(response_parts)
-            if response:
-                self.log.info("Received response: %s", response.strip())
-            return response
-            
-        except Exception as e:
-            self.log.error("Failed to read response: %s", e)
-            return ""
-
-    def shutdown(self) -> None:
-        """Shutdown the module and clean up resources."""
-        if self.serial_connection and self.serial_connection.is_open:
-            self.serial_connection.close()
-            self.log.info("Serial connection closed")
-        
-        self.state = "idle"
-        self.fields.update({"connected": False})
+        return logger
 
     def handle_cmd(self, action: str, params: Dict[str, Any]) -> tuple[bool, str | None, dict]:
         """Handle module commands."""
-        self.log.info(
-            "handle_cmd: action=%s params=%s", 
-            action, 
-            {k: ("***" if k in {"password", "token"} else v) for k, v in (params or {}).items()}
-        )
+        self.log.info(f"Handling command: {action} with params: {params}")
+        
+        try:
+            if action == "status":
+                return self._handle_status()
+            elif action == "power":
+                return self._handle_power(params)
+            elif action == "input":
+                return self._handle_input(params)
+            elif action == "command":
+                return self._handle_command(params)
+            elif action == "navigate":
+                return self._handle_navigate(params)
+            elif action == "adjust":
+                return self._handle_adjust(params)
+            else:
+                return False, f"Unknown action: {action}", {}
+                
+        except Exception as e:
+            self.log.error(f"Error handling {action}: {e}")
+            return False, str(e), {}
 
-        if not self.serial_connection or not self.serial_connection.is_open:
-            return False, "Serial connection not available", {}
+    def _handle_status(self) -> tuple[bool, None, dict]:
+        """Get module status."""
+        status = {
+            "state": self.current_state,
+            "serial_connected": self.serial_manager.connection is not None and self.serial_manager.connection.is_open,
+            "available_commands": list(self.COMMANDS.keys()),
+            "parametric_commands": list(self.PARAMETRIC_COMMANDS.keys())
+        }
+        return True, None, status
 
-        if action == "power_on":
-            success = self._send_command(self.COMMANDS["ON"])
-            if success:
-                self.fields["power_state"] = "on"
-            return success, None if success else "Failed to send power on command", {"power_state": "on" if success else "unknown"}
+    def _handle_power(self, params: Dict[str, Any]) -> tuple[bool, str | None, dict]:
+        """Handle power commands."""
+        state = params.get("state", "").upper()
+        
+        if state not in ["ON", "OFF"]:
+            return False, "Power state must be 'on' or 'off'", {}
+        
+        command = self.COMMANDS[state]
+        success = self.serial_manager.send_command(command)
+        
+        if success:
+            self.current_state["power"] = state.lower()
+            return True, None, {"power": state.lower()}
+        else:
+            return False, "Failed to send power command", {}
 
-        if action == "power_off":
-            success = self._send_command(self.COMMANDS["OFF"])
-            if success:
-                self.fields["power_state"] = "off"
-            return success, None if success else "Failed to send power off command", {"power_state": "off" if success else "unknown"}
+    def _handle_input(self, params: Dict[str, Any]) -> tuple[bool, str | None, dict]:
+        """Handle input selection."""
+        input_source = params.get("source", "").upper()
+        
+        if input_source not in ["HDMI1", "HDMI2"]:
+            return False, "Input source must be 'hdmi1' or 'hdmi2'", {}
+        
+        command = self.COMMANDS[input_source]
+        success = self.serial_manager.send_command(command)
+        
+        if success:
+            self.current_state["input"] = input_source.lower()
+            return True, None, {"input": input_source.lower()}
+        else:
+            return False, "Failed to send input command", {}
 
-        if action == "set_input":
-            input_source = params.get("input")
-            if input_source not in ["HDMI1", "HDMI2"]:
-                return False, "Invalid input source. Must be HDMI1 or HDMI2", {}
-            
-            success = self._send_command(self.COMMANDS[input_source])
-            if success:
-                self.fields["current_input"] = input_source
-            return success, None if success else f"Failed to set input to {input_source}", {"current_input": input_source if success else "unknown"}
+    def _handle_command(self, params: Dict[str, Any]) -> tuple[bool, str | None, dict]:
+        """Handle raw command sending."""
+        cmd = params.get("cmd", "").upper()
+        
+        if cmd not in self.COMMANDS:
+            return False, f"Unknown command: {cmd}. Available: {list(self.COMMANDS.keys())}", {}
+        
+        command = self.COMMANDS[cmd]
+        success = self.serial_manager.send_command(command)
+        
+        if success:
+            return True, None, {"command_sent": cmd}
+        else:
+            return False, f"Failed to send command: {cmd}", {}
 
-        if action == "set_aspect_ratio":
-            ratio = params.get("ratio")
-            if ratio not in ["4:3", "16:9"]:
-                return False, "Invalid aspect ratio. Must be 4:3 or 16:9", {}
-            
-            success = self._send_command(self.COMMANDS[ratio])
-            if success:
-                self.fields["aspect_ratio"] = ratio
-            return success, None if success else f"Failed to set aspect ratio to {ratio}", {"aspect_ratio": ratio if success else "unknown"}
+    def _handle_navigate(self, params: Dict[str, Any]) -> tuple[bool, str | None, dict]:
+        """Handle navigation commands."""
+        direction = params.get("direction", "").upper()
+        nav_commands = ["UP", "DOWN", "LEFT", "RIGHT", "ENTER", "MENU", "BACK"]
+        
+        if direction not in nav_commands:
+            return False, f"Invalid direction. Available: {nav_commands}", {}
+        
+        command = self.COMMANDS[direction]
+        success = self.serial_manager.send_command(command)
+        
+        if success:
+            return True, None, {"navigation": direction.lower()}
+        else:
+            return False, f"Failed to send navigation command: {direction}", {}
 
-        if action == "navigate":
-            direction = params.get("direction")
-            if direction not in ["UP", "DOWN", "LEFT", "RIGHT", "ENTER", "MENU", "BACK"]:
-                return False, "Invalid navigation direction", {}
-            
-            success = self._send_command(self.COMMANDS[direction])
-            return success, None if success else f"Failed to send {direction} command", {"last_navigation": direction if success else None}
+    def _handle_adjust(self, params: Dict[str, Any]) -> tuple[bool, str | None, dict]:
+        """Handle parametric adjustment commands."""
+        adjustment = params.get("type", "").upper()
+        value = params.get("value")
+        
+        if adjustment not in self.PARAMETRIC_COMMANDS:
+            return False, f"Invalid adjustment. Available: {list(self.PARAMETRIC_COMMANDS.keys())}", {}
+        
+        if value is None:
+            return False, "Value parameter required for adjustment commands", {}
+        
+        try:
+            value = int(value)
+        except ValueError:
+            return False, "Value must be an integer", {}
+        
+        # Validate value ranges
+        if adjustment in ["H-IMAGE-SHIFT", "V-IMAGE-SHIFT"] and not (-100 <= value <= 100):
+            return False, "Image shift value must be between -100 and 100", {}
+        elif adjustment in ["H-KEYSTONE", "V-KEYSTONE"] and not (-40 <= value <= 40):
+            return False, "Keystone value must be between -40 and 40", {}
+        
+        command = self.PARAMETRIC_COMMANDS[adjustment].format(value=value)
+        success = self.serial_manager.send_command(command)
+        
+        if success:
+            return True, None, {"adjustment": adjustment.lower(), "value": value}
+        else:
+            return False, f"Failed to send adjustment command: {adjustment}", {}
 
-        if action == "adjust_image":
-            adjustment = params.get("adjustment")
-            value = params.get("value")
-            
-            if adjustment not in ["H-IMAGE-SHIFT", "V-IMAGE-SHIFT", "H-KEYSTONE", "V-KEYSTONE"]:
-                return False, "Invalid adjustment type", {}
-            
-            if not isinstance(value, int):
-                return False, "Adjustment value must be an integer", {}
-            
-            # Validate value ranges
-            if adjustment in ["H-IMAGE-SHIFT", "V-IMAGE-SHIFT"]:
-                if not (-100 <= value <= 100):
-                    return False, "Image shift value must be between -100 and 100", {}
-            elif adjustment in ["H-KEYSTONE", "V-KEYSTONE"]:
-                if not (-40 <= value <= 40):
-                    return False, "Keystone value must be between -40 and 40", {}
-            
-            command = self.COMMANDS[adjustment].format(value=value)
-            success = self._send_command(command)
-            
-            result = {"adjustment": adjustment, "value": value} if success else {}
-            return success, None if success else f"Failed to adjust {adjustment}", result
-
-        if action == "send_raw_command":
-            command = params.get("command")
-            if not command:
-                return False, "Raw command cannot be empty", {}
-            
-            success = self._send_command(command)
-            response = self._read_response() if success else ""
-            
-            return success, None if success else "Failed to send raw command", {"response": response}
-
-        self.log.error("handle_cmd: unknown action=%s", action)
-        return False, f"unknown action: {action}", {}
+    def shutdown(self) -> None:
+        """Shutdown the module and clean up connections."""
+        self.log.info("Shutting down projector module")
+        self.serial_manager.disconnect()

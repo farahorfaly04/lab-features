@@ -1,23 +1,47 @@
-"""NDI Plugin for Lab Platform orchestrator."""
+"""Simplified NDI Plugin for Lab Platform orchestrator."""
+
+import sys
+import time
+from pathlib import Path
+from typing import Dict, Any, List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Dict, Any, List
-import time
-import sys
-from pathlib import Path
-from cyndilib.finder import Finder 
-# Import orchestrator plugin API
+
+try:
+    from cyndilib.finder import Finder
+except Exception:
+    Finder = None  # type: ignore
+
 from lab_orchestrator.plugin_api import OrchestratorPlugin
 from lab_orchestrator.services.events import ack
 
 
+class DeviceCommand(BaseModel):
+    """Model for device commands."""
+    device_id: str
+    action: str
+    params: Dict[str, Any] = {}
+
+
+class NDISourcesResponse(BaseModel):
+    """Response model for NDI sources."""
+    sources: List[str]
+    timestamp: str
+
+
 class NDIPlugin(OrchestratorPlugin):
-    """NDI plugin for the Lab Platform orchestrator."""
+    """Simplified NDI plugin for the Lab Platform orchestrator."""
     
     module_name = "ndi"
 
-    def mqtt_topic_filters(self):
+    def __init__(self, ctx):
+        super().__init__(ctx)
+        self.ndi_sources: List[str] = []
+        self.last_discovery = 0.0
+        self.discovery_timeout = 3.0
+
+    def mqtt_topic_filters(self) -> List[str]:
         """Return MQTT topics this plugin handles."""
         return [f"/lab/orchestrator/{self.module_name}/cmd"]
 
@@ -29,535 +53,219 @@ class NDIPlugin(OrchestratorPlugin):
         device_id = params.get("device_id")
         actor = payload.get("actor", "app")
 
-        # Passthrough actions - forward directly to device module
-        passthrough = {"start", "stop", "restart", "status", "set_input", "record_start", "record_stop", "list_processes"}
-        if action in passthrough:
-            dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
-            self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
-            evt = ack(req_id, True, "DISPATCHED")
-            self.ctx.mqtt.publish_json(f"/lab/orchestrator/{self.module_name}/evt", evt)
-            return
+        try:
+            # Handle different actions
+            if action in self._get_passthrough_actions():
+                self._handle_passthrough(action, device_id, payload, req_id)
+            elif action == "reserve":
+                self._handle_reserve(device_id, params, actor, req_id)
+            elif action == "release":
+                self._handle_release(device_id, actor, req_id)
+            else:
+                self._send_error(req_id, f"Unknown action: {action}")
+                
+        except Exception as e:
+            self._send_error(req_id, str(e))
 
-        # Reserve device
-        if action == "reserve":
-            lease_s = int(params.get("lease_s", 60))
-            key = f"{self.module_name}:{device_id}"
-            ok = self.ctx.registry.lock(key, actor, lease_s)
-            code = "OK" if ok else "IN_USE"
-            err = None if ok else "in_use"
-            self.ctx.mqtt.publish_json(
-                f"/lab/orchestrator/{self.module_name}/evt", 
-                ack(req_id, ok, code, err)
-            )
-            return
+    def _get_passthrough_actions(self) -> set:
+        """Get actions that are passed through to devices."""
+        return {"start", "stop", "restart", "status", "set_input", "record_start", "record_stop", "list_processes"}
 
-        # Release device
-        if action == "release":
-            key = f"{self.module_name}:{device_id}"
-            ok = self.ctx.registry.release(key, actor)
-            code = "OK" if ok else "NOT_OWNER"
-            err = None if ok else "not_owner"
-            self.ctx.mqtt.publish_json(
-                f"/lab/orchestrator/{self.module_name}/evt", 
-                ack(req_id, ok, code, err)
-            )
+    def _handle_passthrough(self, action: str, device_id: str, payload: Dict[str, Any], req_id: str) -> None:
+        """Forward action to device module."""
+        if not device_id:
+            self._send_error(req_id, "device_id required")
             return
-
-        # Schedule commands
-        if action == "schedule":
-            when = params.get("at")
-            cron = params.get("cron")
-            commands = params.get("commands", [])
-            
-            if when:
-                from datetime import datetime
-                run_date = datetime.fromisoformat(when.replace("Z", "+00:00"))
-                self.ctx.scheduler.once(
-                    run_date, 
-                    self._run_commands, 
-                    module=self.module_name, 
-                    commands=commands, 
-                    actor=actor
-                )
-            elif cron:
-                self.ctx.scheduler.cron(
-                    cron, 
-                    self._run_commands, 
-                    module=self.module_name, 
-                    commands=commands, 
-                    actor=actor
-                )
-            
-            self.ctx.mqtt.publish_json(
-                f"/lab/orchestrator/{self.module_name}/evt", 
-                ack(req_id, True, "SCHEDULED")
-            )
-            return
-
-        # Unknown action
-        evt = ack(req_id, False, "BAD_ACTION", f"Unsupported action: {action}")
+        
+        dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
+        self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
+        
+        evt = ack(req_id, True, "DISPATCHED")
         self.ctx.mqtt.publish_json(f"/lab/orchestrator/{self.module_name}/evt", evt)
 
-    def _run_commands(self, module: str, commands: list[Dict[str, Any]], actor: str):
-        """Execute scheduled commands."""
-        import uuid
-        from lab_orchestrator.services.events import now_iso
+    def _handle_reserve(self, device_id: str, params: Dict[str, Any], actor: str, req_id: str) -> None:
+        """Reserve a device for exclusive use."""
+        if not device_id:
+            self._send_error(req_id, "device_id required")
+            return
         
-        for c in commands:
-            device_id = c.get("device_id")
-            if not device_id:
-                continue
+        lease_s = int(params.get("lease_s", 60))
+        key = f"{self.module_name}:{device_id}"
+        success = self.ctx.registry.lock(key, actor, lease_s)
+        
+        code = "OK" if success else "IN_USE"
+        error = None if success else "Device is already in use"
+        
+        evt = ack(req_id, success, code, error)
+        self.ctx.mqtt.publish_json(f"/lab/orchestrator/{self.module_name}/evt", evt)
+
+    def _handle_release(self, device_id: str, actor: str, req_id: str) -> None:
+        """Release device reservation."""
+        if not device_id:
+            self._send_error(req_id, "device_id required")
+            return
+        
+        key = f"{self.module_name}:{device_id}"
+        success = self.ctx.registry.release(key, actor)
+        
+        code = "OK" if success else "NOT_OWNER"
+        error = None if success else "You don't own this device"
+        
+        evt = ack(req_id, success, code, error)
+        self.ctx.mqtt.publish_json(f"/lab/orchestrator/{self.module_name}/evt", evt)
+
+    def _send_error(self, req_id: str, error_message: str) -> None:
+        """Send error response."""
+        evt = ack(req_id, False, "ERROR", error_message)
+        self.ctx.mqtt.publish_json(f"/lab/orchestrator/{self.module_name}/evt", evt)
+
+    def _discover_ndi_sources(self, timeout: float = None) -> List[str]:
+        """Discover available NDI sources."""
+        if not Finder:
+            return []
+        
+        timeout = timeout or self.discovery_timeout
+        current_time = time.time()
+        
+        # Cache discovery results for a short time
+        if current_time - self.last_discovery < 1.0 and self.ndi_sources:
+            return self.ndi_sources
+        
+        try:
+            finder = Finder()
+            time.sleep(timeout)  # Wait for discovery
             
-            key = f"{module}:{device_id}"
-            if not self.ctx.registry.can_use(key, actor):
-                continue
+            sources = []
+            for source in finder.get_sources():
+                sources.append(f"{source.name} ({source.ip})")
             
-            env = {
-                "req_id": str(uuid.uuid4()),
-                "actor": f"host:{actor}",
-                "ts": now_iso(),
-                "action": c.get("action"),
-                "params": c.get("params", {})
+            self.ndi_sources = sources
+            self.last_discovery = current_time
+            return sources
+            
+        except Exception as e:
+            print(f"NDI discovery error: {e}")
+            return []
+
+    def _get_ndi_devices(self) -> List[Dict[str, Any]]:
+        """Get devices with NDI capability."""
+        devices = []
+        for device_id, device_info in self.ctx.registry.devices.items():
+            labels = device_info.get("labels", [])
+            if "ndi" in labels:
+                devices.append({
+                    "device_id": device_id,
+                    "status": device_info.get("status", "unknown"),
+                    "labels": labels
+                })
+        return devices
+
+    def api_router(self) -> Optional[APIRouter]:
+        """Create API router for HTTP endpoints."""
+        router = APIRouter()
+
+        @router.get("/status")
+        def get_status():
+            """Get plugin status."""
+            return {
+                "plugin": self.module_name,
+                "devices": self._get_ndi_devices(),
+                "registry_snapshot": self.ctx.registry.snapshot()
             }
-            env["params"]["device_id"] = device_id
-            self.ctx.mqtt.publish_json(
-                f"/lab/device/{device_id}/{module}/cmd", 
-                env, 
-                qos=1, 
-                retain=False
+
+        @router.get("/sources", response_model=NDISourcesResponse)
+        def get_sources():
+            """Get available NDI sources."""
+            sources = self._discover_ndi_sources()
+            return NDISourcesResponse(
+                sources=sources,
+                timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             )
 
-    def api_router(self):
-        """Create FastAPI router for NDI endpoints."""
-        r = APIRouter()
-
-        class SendBody(BaseModel):
-            device_id: str
-            source: str
-            action: str | None = None  # default to "start"
-
-        class StartBody(BaseModel):
-            device_id: str
-            source: str
-
-        class StopBody(BaseModel):
-            device_id: str
-
-        class RestartBody(BaseModel):
-            device_id: str
-            source: str | None = None
-
-        class RecordStartBody(BaseModel):
-            device_id: str
-            source: str | None = None
-            output_path: str | None = None
-
-        class RecordStopBody(BaseModel):
-            device_id: str
-
-        class SetInputBody(BaseModel):
-            device_id: str
-            source: str
-
-        @r.get("/status")
-        def status():
-            """Get plugin status and registry snapshot."""
-            reg = self.ctx.registry.snapshot()
-            return {
-                "plugin": "ndi",
-                "version": "0.1.0",
-                "registry": reg,
-                "timestamp": time.time()
-            }
-
-        @r.get("/sources")
-        def sources() -> Dict[str, Any]:
-            """Get available NDI sources."""
-            discovered: List[str] = []
-            error = None
-            try:
-                discovered = _discover_ndi_source_names(timeout=3.0)
-            except Exception as e:
-                error = str(e)
-                discovered = []
-            
-            return {
-                "sources": discovered, 
-                "count": len(discovered),
-                "discovery_error": error,
-                "timestamp": time.time()
-            }
-
-        @r.get("/sources/refresh")
-        def refresh_sources() -> Dict[str, Any]:
+        @router.get("/sources/refresh", response_model=NDISourcesResponse)
+        def refresh_sources():
             """Force refresh NDI sources with longer timeout."""
-            discovered: List[str] = []
-            error = None
-            try:
-                discovered = _discover_ndi_source_names(timeout=10.0)  # Longer timeout for manual refresh
-            except Exception as e:
-                error = str(e)
-                discovered = []
-            
-            return {
-                "sources": discovered, 
-                "count": len(discovered),
-                "discovery_error": error,
-                "timestamp": time.time(),
-                "refreshed": True
-            }
+            sources = self._discover_ndi_sources(timeout=5.0)
+            return NDISourcesResponse(
+                sources=sources,
+                timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            )
 
-        @r.get("/devices")
-        def devices() -> Dict[str, Any]:
+        @router.get("/devices")
+        def get_devices():
             """Get devices with NDI capability."""
-            reg = self.ctx.registry.snapshot()
-            ndi_devices = {}
-            
-            for did, meta in reg.get("devices", {}).items():
-                modules = meta.get("modules", [])
-                if "ndi" in modules:
-                    device_state = meta.get("state", {}).get("ndi", {})
-                    ndi_devices[did] = {
-                        "device_id": did,
-                        "online": meta.get("online", True),
-                        "capabilities": meta.get("capabilities", {}).get("ndi", {}),
-                        "state": device_state,
-                        "current_input": device_state.get("input"),
-                        "viewer_running": device_state.get("pid") is not None,
-                        "recording": device_state.get("recording", False),
-                        "last_seen": meta.get("last_seen"),
-                    }
-            
-            return {"devices": ndi_devices, "count": len(ndi_devices)}
+            return {"devices": self._get_ndi_devices()}
 
-        @r.get("/devices/{device_id}")
-        def device_detail(device_id: str) -> Dict[str, Any]:
-            """Get detailed information about a specific NDI device."""
-            reg = self.ctx.registry.snapshot()
-            device_meta = reg.get("devices", {}).get(device_id)
-            
-            if not device_meta:
+        @router.get("/devices/{device_id}")
+        def get_device(device_id: str):
+            """Get specific device information."""
+            device_info = self.ctx.registry.devices.get(device_id)
+            if not device_info:
                 raise HTTPException(status_code=404, detail="Device not found")
             
-            if "ndi" not in device_meta.get("modules", []):
+            labels = device_info.get("labels", [])
+            if "ndi" not in labels:
                 raise HTTPException(status_code=400, detail="Device does not support NDI")
             
-            device_state = device_meta.get("state", {}).get("ndi", {})
-            
-            return {
-                "device_id": device_id,
-                "online": device_meta.get("online", True),
-                "capabilities": device_meta.get("capabilities", {}).get("ndi", {}),
-                "state": device_state,
-                "current_input": device_state.get("input"),
-                "viewer_running": device_state.get("pid") is not None,
-                "viewer_pid": device_state.get("pid"),
-                "recording": device_state.get("recording", False),
-                "record_pid": device_state.get("record_pid"),
-                "last_seen": device_meta.get("last_seen"),
-                "uptime": device_meta.get("uptime"),
-            }
+            return {"device": device_info}
 
-        @r.post("/start")
-        def start_viewer(body: StartBody):
+        @router.post("/start")
+        def start_ndi(cmd: DeviceCommand):
             """Start NDI viewer on device."""
-            device_id = body.device_id
-            source = body.source
-            
-            # Validate device exists
-            reg = self.ctx.registry.snapshot()
-            if device_id not in reg.get("devices", {}):
-                raise HTTPException(status_code=404, detail="Unknown device")
-
-            import uuid
-            from lab_orchestrator.services.events import now_iso
-            
             payload = {
-                "req_id": str(uuid.uuid4()),
+                "req_id": f"api-{int(time.time() * 1000)}",
                 "actor": "api",
-                "ts": now_iso(),
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "action": "start",
-                "params": {"device_id": device_id, "source": source},
+                "params": {"device_id": cmd.device_id, **cmd.params}
             }
             
-            dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
+            dev_topic = f"/lab/device/{cmd.device_id}/{self.module_name}/cmd"
             self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
             
-            return {
-                "ok": True, 
-                "dispatched": True, 
-                "device_id": device_id, 
-                "source": source, 
-                "action": "start"
-            }
+            return {"status": "dispatched", "device_id": cmd.device_id, "action": "start"}
 
-        @r.post("/stop")
-        def stop_viewer(body: StopBody):
+        @router.post("/stop")
+        def stop_ndi(cmd: DeviceCommand):
             """Stop NDI viewer on device."""
-            device_id = body.device_id
-            
-            # Validate device exists
-            reg = self.ctx.registry.snapshot()
-            if device_id not in reg.get("devices", {}):
-                raise HTTPException(status_code=404, detail="Unknown device")
-
-            import uuid
-            from lab_orchestrator.services.events import now_iso
-            
             payload = {
-                "req_id": str(uuid.uuid4()),
+                "req_id": f"api-{int(time.time() * 1000)}",
                 "actor": "api",
-                "ts": now_iso(),
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "action": "stop",
-                "params": {"device_id": device_id},
+                "params": {"device_id": cmd.device_id, **cmd.params}
             }
             
-            dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
+            dev_topic = f"/lab/device/{cmd.device_id}/{self.module_name}/cmd"
             self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
             
-            return {
-                "ok": True, 
-                "dispatched": True, 
-                "device_id": device_id, 
-                "action": "stop"
-            }
+            return {"status": "dispatched", "device_id": cmd.device_id, "action": "stop"}
 
-        @r.post("/restart")
-        def restart_viewer(body: RestartBody):
-            """Restart NDI viewer on device."""
-            device_id = body.device_id
-            source = body.source
-            
-            # Validate device exists
-            reg = self.ctx.registry.snapshot()
-            if device_id not in reg.get("devices", {}):
-                raise HTTPException(status_code=404, detail="Unknown device")
-
-            import uuid
-            from lab_orchestrator.services.events import now_iso
-            
-            params = {"device_id": device_id}
-            if source:
-                params["source"] = source
-                
-            payload = {
-                "req_id": str(uuid.uuid4()),
-                "actor": "api",
-                "ts": now_iso(),
-                "action": "restart",
-                "params": params,
-            }
-            
-            dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
-            self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
-            
-            return {
-                "ok": True, 
-                "dispatched": True, 
-                "device_id": device_id, 
-                "source": source,
-                "action": "restart"
-            }
-
-        @r.post("/input")
-        def set_input(body: SetInputBody):
+        @router.post("/input")
+        def set_input(cmd: DeviceCommand):
             """Set NDI input source on device."""
-            device_id = body.device_id
-            source = body.source
-            
-            # Validate device exists
-            reg = self.ctx.registry.snapshot()
-            if device_id not in reg.get("devices", {}):
-                raise HTTPException(status_code=404, detail="Unknown device")
-
-            import uuid
-            from lab_orchestrator.services.events import now_iso
+            if "source" not in cmd.params:
+                raise HTTPException(status_code=400, detail="source parameter required")
             
             payload = {
-                "req_id": str(uuid.uuid4()),
+                "req_id": f"api-{int(time.time() * 1000)}",
                 "actor": "api",
-                "ts": now_iso(),
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "action": "set_input",
-                "params": {"device_id": device_id, "source": source},
+                "params": {"device_id": cmd.device_id, **cmd.params}
             }
             
-            dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
+            dev_topic = f"/lab/device/{cmd.device_id}/{self.module_name}/cmd"
             self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
             
-            return {
-                "ok": True, 
-                "dispatched": True, 
-                "device_id": device_id, 
-                "source": source, 
-                "action": "set_input"
-            }
+            return {"status": "dispatched", "device_id": cmd.device_id, "action": "set_input"}
 
-        @r.post("/record/start")
-        def start_recording(body: RecordStartBody):
-            """Start recording NDI stream."""
-            device_id = body.device_id
-            source = body.source
-            output_path = body.output_path
-            
-            # Validate device exists
-            reg = self.ctx.registry.snapshot()
-            if device_id not in reg.get("devices", {}):
-                raise HTTPException(status_code=404, detail="Unknown device")
+        return router
 
-            import uuid
-            from lab_orchestrator.services.events import now_iso
-            
-            params = {"device_id": device_id}
-            if source:
-                params["source"] = source
-            if output_path:
-                params["output_path"] = output_path
-                
-            payload = {
-                "req_id": str(uuid.uuid4()),
-                "actor": "api",
-                "ts": now_iso(),
-                "action": "record_start",
-                "params": params,
-            }
-            
-            dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
-            self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
-            
-            return {
-                "ok": True, 
-                "dispatched": True, 
-                "device_id": device_id, 
-                "source": source,
-                "output_path": output_path,
-                "action": "record_start"
-            }
-
-        @r.post("/record/stop")
-        def stop_recording(body: RecordStopBody):
-            """Stop recording NDI stream."""
-            device_id = body.device_id
-            
-            # Validate device exists
-            reg = self.ctx.registry.snapshot()
-            if device_id not in reg.get("devices", {}):
-                raise HTTPException(status_code=404, detail="Unknown device")
-
-            import uuid
-            from lab_orchestrator.services.events import now_iso
-            
-            payload = {
-                "req_id": str(uuid.uuid4()),
-                "actor": "api",
-                "ts": now_iso(),
-                "action": "record_stop",
-                "params": {"device_id": device_id},
-            }
-            
-            dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
-            self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
-            
-            return {
-                "ok": True, 
-                "dispatched": True, 
-                "device_id": device_id, 
-                "action": "record_stop"
-            }
-
-        @r.get("/processes/{device_id}")
-        def list_processes(device_id: str):
-            """List NDI processes running on device."""
-            # Validate device exists
-            reg = self.ctx.registry.snapshot()
-            if device_id not in reg.get("devices", {}):
-                raise HTTPException(status_code=404, detail="Unknown device")
-
-            import uuid
-            from lab_orchestrator.services.events import now_iso
-            
-            payload = {
-                "req_id": str(uuid.uuid4()),
-                "actor": "api",
-                "ts": now_iso(),
-                "action": "list_processes",
-                "params": {"device_id": device_id},
-            }
-            
-            dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
-            self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
-            
-            return {
-                "ok": True, 
-                "dispatched": True, 
-                "device_id": device_id, 
-                "action": "list_processes"
-            }
-
-        # Legacy endpoint for backward compatibility
-        @r.post("/send")
-        def send(body: SendBody):
-            """Send command to NDI device (legacy endpoint)."""
-            device_id = body.device_id
-            source = body.source
-            action = body.action or "start"
-            
-            # Validate device exists
-            reg = self.ctx.registry.snapshot()
-            if device_id not in reg.get("devices", {}):
-                raise HTTPException(status_code=404, detail="unknown device")
-
-            import uuid
-            from lab_orchestrator.services.events import now_iso
-            
-            payload = {
-                "req_id": str(uuid.uuid4()),
-                "actor": "api",
-                "ts": now_iso(),
-                "action": action,
-                "params": {"device_id": device_id, "source": source},
-            }
-            
-            dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
-            self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
-            
-            return {
-                "ok": True, 
-                "dispatched": True, 
-                "device_id": device_id, 
-                "source": source, 
-                "action": action
-            }
-
-        return r
-
-    def ui_mount(self):
+    def ui_mount(self) -> Optional[Dict[str, str]]:
         """Return UI mount configuration."""
-        return {"path": f"/ui/{self.module_name}", "template": "ndi.html", "title": "NDI"}
-
-
-def _discover_ndi_source_names(timeout: float = 3.0) -> List[str]:
-    """Discover NDI sources and return a list of human-readable names.
-
-    This function attempts to use NDI discovery to find available sources.
-    Falls back to an empty list if discovery fails.
-    """
-
-    # Try to use cyndilib for NDI discovery        
-    finder = Finder()
-    finder.open()
-    
-    try:
-        end_time = time.time() + timeout
-        while time.time() < end_time:
-            changed = finder.wait_for_sources(timeout=end_time - time.time())
-            if changed:
-                finder.update_sources()
-            time.sleep(0.1)
-
-        names: List[str] = []
-        for src in finder.iter_sources():
-            names.append(src.name)
-        return names
-    finally:
-        finder.close()
-
+        return {
+            "path": "/ui/ndi",
+            "title": "NDI",
+            "template": "ndi.html"
+        }

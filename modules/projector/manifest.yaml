@@ -79,3 +79,5 @@ actions:
         type: "string"
         required: true
         description: "Raw ASCII command string"
+  - name: "status"
+    description: "Query current projector connection/status (best-effort)"

@@ -1,22 +1,30 @@
-"""Projector Plugin for Lab Platform orchestrator."""
+"""Simplified Projector Plugin for Lab Platform orchestrator."""
+
+import sys
+import time
+from pathlib import Path
+from typing import Dict, Any, List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Dict, Any, List
-import sys
-from pathlib import Path
 
-# Import orchestrator plugin API
 from lab_orchestrator.plugin_api import OrchestratorPlugin
 from lab_orchestrator.services.events import ack
 
 
+class DeviceCommand(BaseModel):
+    """Model for device commands."""
+    device_id: str
+    action: str
+    params: Dict[str, Any] = {}
+
+
 class ProjectorPlugin(OrchestratorPlugin):
-    """Projector plugin for the Lab Platform orchestrator."""
+    """Simplified projector plugin for the Lab Platform orchestrator."""
     
     module_name = "projector"
 
-    def mqtt_topic_filters(self):
+    def mqtt_topic_filters(self) -> List[str]:
         """Return MQTT topics this plugin handles."""
         return [f"/lab/orchestrator/{self.module_name}/cmd"]
 
@@ -28,385 +36,240 @@ class ProjectorPlugin(OrchestratorPlugin):
         device_id = params.get("device_id")
         actor = payload.get("actor", "app")
 
-        # Passthrough actions - forward directly to device module
-        passthrough = {
-            "power_on", "power_off", "set_input", "set_aspect_ratio", 
-            "navigate", "adjust_image", "send_raw_command"
-        }
-        if action in passthrough:
-            dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
-            self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
-            evt = ack(req_id, True, "DISPATCHED")
-            self.ctx.mqtt.publish_json(f"/lab/orchestrator/{self.module_name}/evt", evt)
-            return
+        try:
+            # Handle different actions
+            if action in self._get_passthrough_actions():
+                self._handle_passthrough(action, device_id, payload, req_id)
+            elif action == "reserve":
+                self._handle_reserve(device_id, params, actor, req_id)
+            elif action == "release":
+                self._handle_release(device_id, actor, req_id)
+            else:
+                self._send_error(req_id, f"Unknown action: {action}")
+                
+        except Exception as e:
+            self._send_error(req_id, str(e))
 
-        # Reserve device
-        if action == "reserve":
-            lease_s = int(params.get("lease_s", 60))
-            key = f"{self.module_name}:{device_id}"
-            ok = self.ctx.registry.lock(key, actor, lease_s)
-            code = "OK" if ok else "IN_USE"
-            err = None if ok else "in_use"
-            self.ctx.mqtt.publish_json(
-                f"/lab/orchestrator/{self.module_name}/evt", 
-                ack(req_id, ok, code, err)
-            )
-            return
+    def _get_passthrough_actions(self) -> set:
+        """Get actions that are passed through to devices."""
+        return {"status", "power", "input", "command", "navigate", "adjust"}
 
-        # Release device
-        if action == "release":
-            key = f"{self.module_name}:{device_id}"
-            ok = self.ctx.registry.release(key, actor)
-            code = "OK" if ok else "NOT_OWNER"
-            err = None if ok else "not_owner"
-            self.ctx.mqtt.publish_json(
-                f"/lab/orchestrator/{self.module_name}/evt", 
-                ack(req_id, ok, code, err)
-            )
+    def _handle_passthrough(self, action: str, device_id: str, payload: Dict[str, Any], req_id: str) -> None:
+        """Forward action to device module."""
+        if not device_id:
+            self._send_error(req_id, "device_id required")
             return
-
-        # Schedule commands
-        if action == "schedule":
-            when = params.get("at")
-            cron = params.get("cron")
-            commands = params.get("commands", [])
-            
-            if when:
-                from datetime import datetime
-                run_date = datetime.fromisoformat(when.replace("Z", "+00:00"))
-                self.ctx.scheduler.once(
-                    run_date, 
-                    self._run_commands, 
-                    module=self.module_name, 
-                    commands=commands, 
-                    actor=actor
-                )
-            elif cron:
-                self.ctx.scheduler.cron(
-                    cron, 
-                    self._run_commands, 
-                    module=self.module_name, 
-                    commands=commands, 
-                    actor=actor
-                )
-            
-            self.ctx.mqtt.publish_json(
-                f"/lab/orchestrator/{self.module_name}/evt", 
-                ack(req_id, True, "SCHEDULED")
-            )
-            return
-
-        # Unknown action
-        evt = ack(req_id, False, "BAD_ACTION", f"Unsupported action: {action}")
+        
+        dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
+        self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
+        
+        evt = ack(req_id, True, "DISPATCHED")
         self.ctx.mqtt.publish_json(f"/lab/orchestrator/{self.module_name}/evt", evt)
 
-    def _run_commands(self, module: str, commands: list[Dict[str, Any]], actor: str):
-        """Execute scheduled commands."""
-        import uuid
-        from lab_orchestrator.services.events import now_iso
+    def _handle_reserve(self, device_id: str, params: Dict[str, Any], actor: str, req_id: str) -> None:
+        """Reserve a device for exclusive use."""
+        if not device_id:
+            self._send_error(req_id, "device_id required")
+            return
         
-        for c in commands:
-            device_id = c.get("device_id")
-            if not device_id:
-                continue
-            
-            key = f"{module}:{device_id}"
-            if not self.ctx.registry.can_use(key, actor):
-                continue
-            
-            env = {
-                "req_id": str(uuid.uuid4()),
-                "actor": f"host:{actor}",
-                "ts": now_iso(),
-                "action": c.get("action"),
-                "params": c.get("params", {})
-            }
-            env["params"]["device_id"] = device_id
-            self.ctx.mqtt.publish_json(
-                f"/lab/device/{device_id}/{module}/cmd", 
-                env, 
-                qos=1, 
-                retain=False
-            )
+        lease_s = int(params.get("lease_s", 60))
+        key = f"{self.module_name}:{device_id}"
+        success = self.ctx.registry.lock(key, actor, lease_s)
+        
+        code = "OK" if success else "IN_USE"
+        error = None if success else "Device is already in use"
+        
+        evt = ack(req_id, success, code, error)
+        self.ctx.mqtt.publish_json(f"/lab/orchestrator/{self.module_name}/evt", evt)
 
-    def api_router(self):
-        """Create FastAPI router for projector endpoints."""
-        r = APIRouter()
+    def _handle_release(self, device_id: str, actor: str, req_id: str) -> None:
+        """Release device reservation."""
+        if not device_id:
+            self._send_error(req_id, "device_id required")
+            return
+        
+        key = f"{self.module_name}:{device_id}"
+        success = self.ctx.registry.release(key, actor)
+        
+        code = "OK" if success else "NOT_OWNER"
+        error = None if success else "You don't own this device"
+        
+        evt = ack(req_id, success, code, error)
+        self.ctx.mqtt.publish_json(f"/lab/orchestrator/{self.module_name}/evt", evt)
 
-        class PowerBody(BaseModel):
-            device_id: str
-            power: str  # "on" or "off"
+    def _send_error(self, req_id: str, error_message: str) -> None:
+        """Send error response."""
+        evt = ack(req_id, False, "ERROR", error_message)
+        self.ctx.mqtt.publish_json(f"/lab/orchestrator/{self.module_name}/evt", evt)
 
-        class InputBody(BaseModel):
-            device_id: str
-            input: str  # "HDMI1" or "HDMI2"
+    def _get_projector_devices(self) -> List[Dict[str, Any]]:
+        """Get devices with projector capability."""
+        devices = []
+        for device_id, device_info in self.ctx.registry.devices.items():
+            labels = device_info.get("labels", [])
+            if "projector" in labels:
+                devices.append({
+                    "device_id": device_id,
+                    "status": device_info.get("status", "unknown"),
+                    "labels": labels
+                })
+        return devices
 
-        class AspectBody(BaseModel):
-            device_id: str
-            ratio: str  # "4:3" or "16:9"
+    def api_router(self) -> Optional[APIRouter]:
+        """Create API router for HTTP endpoints."""
+        router = APIRouter()
 
-        class NavigateBody(BaseModel):
-            device_id: str
-            direction: str  # "UP", "DOWN", "LEFT", "RIGHT", "ENTER", "MENU", "BACK"
-
-        class AdjustBody(BaseModel):
-            device_id: str
-            adjustment: str  # "H-IMAGE-SHIFT", "V-IMAGE-SHIFT", "H-KEYSTONE", "V-KEYSTONE"
-            value: int
-
-        class RawCommandBody(BaseModel):
-            device_id: str
-            command: str
-
-        @r.get("/status")
-        def status():
+        @router.get("/status")
+        def get_status():
             """Get plugin status."""
-            reg = self.ctx.registry.snapshot()
-            return reg
+            return {
+                "plugin": self.module_name,
+                "devices": self._get_projector_devices(),
+                "registry_snapshot": self.ctx.registry.snapshot()
+            }
 
-        @r.get("/devices")
-        def devices() -> Dict[str, Any]:
+        @router.get("/devices")
+        def get_devices():
             """Get devices with projector capability."""
-            reg = self.ctx.registry.snapshot()
-            projector_devices = {}
-            
-            for did, meta in reg.get("devices", {}).items():
-                modules = meta.get("modules", [])
-                if "projector" in modules:
-                    projector_devices[did] = {
-                        "device_id": did,
-                        "online": meta.get("online", True),
-                        "capabilities": meta.get("capabilities", {}).get("projector", {}),
-                        "current_state": meta.get("state", {}),
-                    }
-            
-            return {"devices": projector_devices}
+            return {"devices": self._get_projector_devices()}
 
-        @r.post("/power")
-        def power(body: PowerBody):
-            """Control projector power."""
-            device_id = body.device_id
-            power_state = body.power.lower()
+        @router.get("/devices/{device_id}")
+        def get_device(device_id: str):
+            """Get specific device information."""
+            device_info = self.ctx.registry.devices.get(device_id)
+            if not device_info:
+                raise HTTPException(status_code=404, detail="Device not found")
             
-            if power_state not in ["on", "off"]:
-                raise HTTPException(status_code=400, detail="Power must be 'on' or 'off'")
+            labels = device_info.get("labels", [])
+            if "projector" not in labels:
+                raise HTTPException(status_code=400, detail="Device does not support projector control")
             
-            # Validate device exists
-            reg = self.ctx.registry.snapshot()
-            if device_id not in reg.get("devices", {}):
-                raise HTTPException(status_code=404, detail="Unknown device")
+            return {"device": device_info}
 
-            import uuid
-            from lab_orchestrator.services.events import now_iso
+        @router.post("/power")
+        def set_power(cmd: DeviceCommand):
+            """Set projector power state."""
+            if "state" not in cmd.params:
+                raise HTTPException(status_code=400, detail="state parameter required (on/off)")
             
-            action = "power_on" if power_state == "on" else "power_off"
+            state = cmd.params["state"].lower()
+            if state not in ["on", "off"]:
+                raise HTTPException(status_code=400, detail="state must be 'on' or 'off'")
+            
             payload = {
-                "req_id": str(uuid.uuid4()),
+                "req_id": f"api-{int(time.time() * 1000)}",
                 "actor": "api",
-                "ts": now_iso(),
-                "action": action,
-                "params": {"device_id": device_id},
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "action": "power",
+                "params": {"device_id": cmd.device_id, **cmd.params}
             }
             
-            dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
+            dev_topic = f"/lab/device/{cmd.device_id}/{self.module_name}/cmd"
             self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
             
-            return {
-                "ok": True, 
-                "dispatched": True, 
-                "device_id": device_id, 
-                "action": action
-            }
+            return {"status": "dispatched", "device_id": cmd.device_id, "action": "power", "state": state}
 
-        @r.post("/input")
-        def set_input(body: InputBody):
+        @router.post("/input")
+        def set_input(cmd: DeviceCommand):
             """Set projector input source."""
-            device_id = body.device_id
-            input_source = body.input
+            if "source" not in cmd.params:
+                raise HTTPException(status_code=400, detail="source parameter required (hdmi1/hdmi2)")
             
-            if input_source not in ["HDMI1", "HDMI2"]:
-                raise HTTPException(status_code=400, detail="Input must be 'HDMI1' or 'HDMI2'")
-            
-            # Validate device exists
-            reg = self.ctx.registry.snapshot()
-            if device_id not in reg.get("devices", {}):
-                raise HTTPException(status_code=404, detail="Unknown device")
-
-            import uuid
-            from lab_orchestrator.services.events import now_iso
+            source = cmd.params["source"].lower()
+            if source not in ["hdmi1", "hdmi2"]:
+                raise HTTPException(status_code=400, detail="source must be 'hdmi1' or 'hdmi2'")
             
             payload = {
-                "req_id": str(uuid.uuid4()),
+                "req_id": f"api-{int(time.time() * 1000)}",
                 "actor": "api",
-                "ts": now_iso(),
-                "action": "set_input",
-                "params": {"device_id": device_id, "input": input_source},
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "action": "input",
+                "params": {"device_id": cmd.device_id, **cmd.params}
             }
             
-            dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
+            dev_topic = f"/lab/device/{cmd.device_id}/{self.module_name}/cmd"
             self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
             
-            return {
-                "ok": True, 
-                "dispatched": True, 
-                "device_id": device_id, 
-                "input": input_source
-            }
+            return {"status": "dispatched", "device_id": cmd.device_id, "action": "input", "source": source}
 
-        @r.post("/aspect")
-        def set_aspect(body: AspectBody):
-            """Set projector aspect ratio."""
-            device_id = body.device_id
-            ratio = body.ratio
-            
-            if ratio not in ["4:3", "16:9"]:
-                raise HTTPException(status_code=400, detail="Aspect ratio must be '4:3' or '16:9'")
-            
-            # Validate device exists
-            reg = self.ctx.registry.snapshot()
-            if device_id not in reg.get("devices", {}):
-                raise HTTPException(status_code=404, detail="Unknown device")
-
-            import uuid
-            from lab_orchestrator.services.events import now_iso
-            
-            payload = {
-                "req_id": str(uuid.uuid4()),
-                "actor": "api",
-                "ts": now_iso(),
-                "action": "set_aspect_ratio",
-                "params": {"device_id": device_id, "ratio": ratio},
-            }
-            
-            dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
-            self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
-            
-            return {
-                "ok": True, 
-                "dispatched": True, 
-                "device_id": device_id, 
-                "aspect_ratio": ratio
-            }
-
-        @r.post("/navigate")
-        def navigate(body: NavigateBody):
-            """Send navigation command to projector."""
-            device_id = body.device_id
-            direction = body.direction.upper()
-            
-            valid_directions = ["UP", "DOWN", "LEFT", "RIGHT", "ENTER", "MENU", "BACK"]
-            if direction not in valid_directions:
-                raise HTTPException(status_code=400, detail=f"Direction must be one of: {valid_directions}")
-            
-            # Validate device exists
-            reg = self.ctx.registry.snapshot()
-            if device_id not in reg.get("devices", {}):
-                raise HTTPException(status_code=404, detail="Unknown device")
-
-            import uuid
-            from lab_orchestrator.services.events import now_iso
-            
-            payload = {
-                "req_id": str(uuid.uuid4()),
-                "actor": "api",
-                "ts": now_iso(),
-                "action": "navigate",
-                "params": {"device_id": device_id, "direction": direction},
-            }
-            
-            dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
-            self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
-            
-            return {
-                "ok": True, 
-                "dispatched": True, 
-                "device_id": device_id, 
-                "direction": direction
-            }
-
-        @r.post("/adjust")
-        def adjust_image(body: AdjustBody):
-            """Adjust projector image settings."""
-            device_id = body.device_id
-            adjustment = body.adjustment.upper()
-            value = body.value
-            
-            valid_adjustments = ["H-IMAGE-SHIFT", "V-IMAGE-SHIFT", "H-KEYSTONE", "V-KEYSTONE"]
-            if adjustment not in valid_adjustments:
-                raise HTTPException(status_code=400, detail=f"Adjustment must be one of: {valid_adjustments}")
-            
-            # Validate value ranges
-            if adjustment in ["H-IMAGE-SHIFT", "V-IMAGE-SHIFT"]:
-                if not (-100 <= value <= 100):
-                    raise HTTPException(status_code=400, detail="Image shift value must be between -100 and 100")
-            elif adjustment in ["H-KEYSTONE", "V-KEYSTONE"]:
-                if not (-40 <= value <= 40):
-                    raise HTTPException(status_code=400, detail="Keystone value must be between -40 and 40")
-            
-            # Validate device exists
-            reg = self.ctx.registry.snapshot()
-            if device_id not in reg.get("devices", {}):
-                raise HTTPException(status_code=404, detail="Unknown device")
-
-            import uuid
-            from lab_orchestrator.services.events import now_iso
-            
-            payload = {
-                "req_id": str(uuid.uuid4()),
-                "actor": "api",
-                "ts": now_iso(),
-                "action": "adjust_image",
-                "params": {"device_id": device_id, "adjustment": adjustment, "value": value},
-            }
-            
-            dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
-            self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
-            
-            return {
-                "ok": True, 
-                "dispatched": True, 
-                "device_id": device_id, 
-                "adjustment": adjustment,
-                "value": value
-            }
-
-        @r.post("/raw")
-        def raw_command(body: RawCommandBody):
+        @router.post("/command")
+        def send_command(cmd: DeviceCommand):
             """Send raw command to projector."""
-            device_id = body.device_id
-            command = body.command
-            
-            if not command.strip():
-                raise HTTPException(status_code=400, detail="Command cannot be empty")
-            
-            # Validate device exists
-            reg = self.ctx.registry.snapshot()
-            if device_id not in reg.get("devices", {}):
-                raise HTTPException(status_code=404, detail="Unknown device")
-
-            import uuid
-            from lab_orchestrator.services.events import now_iso
+            if "cmd" not in cmd.params:
+                raise HTTPException(status_code=400, detail="cmd parameter required")
             
             payload = {
-                "req_id": str(uuid.uuid4()),
+                "req_id": f"api-{int(time.time() * 1000)}",
                 "actor": "api",
-                "ts": now_iso(),
-                "action": "send_raw_command",
-                "params": {"device_id": device_id, "command": command},
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "action": "command",
+                "params": {"device_id": cmd.device_id, **cmd.params}
             }
             
-            dev_topic = f"/lab/device/{device_id}/{self.module_name}/cmd"
+            dev_topic = f"/lab/device/{cmd.device_id}/{self.module_name}/cmd"
             self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
             
-            return {
-                "ok": True, 
-                "dispatched": True, 
-                "device_id": device_id, 
-                "command": command
+            return {"status": "dispatched", "device_id": cmd.device_id, "action": "command"}
+
+        @router.post("/navigate")
+        def navigate(cmd: DeviceCommand):
+            """Send navigation command to projector."""
+            if "direction" not in cmd.params:
+                raise HTTPException(status_code=400, detail="direction parameter required")
+            
+            direction = cmd.params["direction"].lower()
+            valid_directions = ["up", "down", "left", "right", "enter", "menu", "back"]
+            if direction not in valid_directions:
+                raise HTTPException(status_code=400, detail=f"direction must be one of: {valid_directions}")
+            
+            payload = {
+                "req_id": f"api-{int(time.time() * 1000)}",
+                "actor": "api",
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "action": "navigate",
+                "params": {"device_id": cmd.device_id, **cmd.params}
             }
+            
+            dev_topic = f"/lab/device/{cmd.device_id}/{self.module_name}/cmd"
+            self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
+            
+            return {"status": "dispatched", "device_id": cmd.device_id, "action": "navigate", "direction": direction}
 
-        return r
+        @router.post("/adjust")
+        def adjust(cmd: DeviceCommand):
+            """Send adjustment command to projector."""
+            if "type" not in cmd.params or "value" not in cmd.params:
+                raise HTTPException(status_code=400, detail="type and value parameters required")
+            
+            adjustment_type = cmd.params["type"].lower()
+            valid_types = ["h-image-shift", "v-image-shift", "h-keystone", "v-keystone"]
+            if adjustment_type not in valid_types:
+                raise HTTPException(status_code=400, detail=f"type must be one of: {valid_types}")
+            
+            try:
+                value = int(cmd.params["value"])
+            except ValueError:
+                raise HTTPException(status_code=400, detail="value must be an integer")
+            
+            payload = {
+                "req_id": f"api-{int(time.time() * 1000)}",
+                "actor": "api",
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "action": "adjust",
+                "params": {"device_id": cmd.device_id, **cmd.params}
+            }
+            
+            dev_topic = f"/lab/device/{cmd.device_id}/{self.module_name}/cmd"
+            self.ctx.mqtt.publish_json(dev_topic, payload, qos=1, retain=False)
+            
+            return {"status": "dispatched", "device_id": cmd.device_id, "action": "adjust", "type": adjustment_type, "value": value}
 
-    def ui_mount(self):
+        return router
+
+    def ui_mount(self) -> Optional[Dict[str, str]]:
         """Return UI mount configuration."""
-        return {"path": f"/ui/{self.module_name}", "template": "projector.html", "title": "Projector Control"}
+        return {
+            "path": "/ui/projector",
+            "title": "Projector",
+            "template": "projector.html"
+        }
